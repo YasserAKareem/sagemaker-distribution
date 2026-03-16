@@ -2,3 +2,24 @@ __pycache__
 .idea
 .DS_Store
 .vscode
+
+# Docker Compose and local deployment
+.env
+logs/
+models/
+*.log
+
+# Docker volumes data (for backup purposes)
+*-data/
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# MLflow artifacts (if stored locally)
+mlruns/
+mlartifacts/

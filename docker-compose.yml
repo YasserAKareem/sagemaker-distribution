@@ -1,0 +1,508 @@
+###############################################################################
+# Open Source AI/ML Platform - 100% Local Deployment
+# Alternative to AWS SageMaker Distribution
+###############################################################################
+
+services:
+  #############################################################################
+  # 1. JupyterLab - Primary Development Environment
+  #############################################################################
+  jupyter:
+    image: jupyter/scipy-notebook:latest
+    container_name: ml-jupyter
+    hostname: jupyter
+    ports:
+      - "8888:8888"
+    volumes:
+      - jupyter-data:/home/jovyan/work
+      - ./notebooks:/home/jovyan/notebooks
+      - ./models:/home/jovyan/models
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - GRANT_SUDO=yes
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
+      - OLLAMA_HOST=http://ollama:11434
+    user: root
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+    networks:
+      - ml-network
+    depends_on:
+      - postgres
+      - redis
+      - minio
+      - mlflow
+      - ollama
+    restart: unless-stopped
+
+  #############################################################################
+  # 2. VS Code Server - Alternative IDE
+  #############################################################################
+  code-server:
+    image: codercom/code-server:latest
+    container_name: ml-code-server
+    hostname: code-server
+    ports:
+      - "8443:8080"
+    volumes:
+      - code-data:/home/coder
+      - ./notebooks:/home/coder/notebooks
+      - ./models:/home/coder/models
+    environment:
+      - PASSWORD=admin
+      - SUDO_PASSWORD=admin
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - OLLAMA_HOST=http://ollama:11434
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  #############################################################################
+  # 3. PostgreSQL - Metadata Store
+  #############################################################################
+  postgres:
+    image: postgres:16-alpine
+    container_name: ml-postgres
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    environment:
+      - POSTGRES_USER=mluser
+      - POSTGRES_PASSWORD=mlpassword
+      - POSTGRES_DB=mlplatform
+      - POSTGRES_MULTIPLE_DATABASES=mlflow,airflow,feast
+    networks:
+      - ml-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mluser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  #############################################################################
+  # 4. Redis - Cache & Message Queue
+  #############################################################################
+  redis:
+    image: redis:7-alpine
+    container_name: ml-redis
+    hostname: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - ml-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  #############################################################################
+  # 5. MinIO - S3-Compatible Object Storage
+  #############################################################################
+  minio:
+    image: minio/minio:latest
+    container_name: ml-minio
+    hostname: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    networks:
+      - ml-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # MinIO Client - Create initial buckets
+  minio-init:
+    image: minio/mc:latest
+    container_name: ml-minio-init
+    depends_on:
+      - minio
+    networks:
+      - ml-network
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/mlflow || true;
+      /usr/bin/mc mb myminio/datasets || true;
+      /usr/bin/mc mb myminio/models || true;
+      /usr/bin/mc mb myminio/artifacts || true;
+      /usr/bin/mc policy set download myminio/mlflow;
+      echo 'MinIO buckets created successfully';
+      exit 0;
+      "
+
+  #############################################################################
+  # 6. MLflow - Experiment Tracking & Model Registry
+  #############################################################################
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: ml-mlflow
+    hostname: mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    environment:
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - BACKEND_STORE_URI=postgresql://mluser:mlpassword@postgres:5432/mlflow
+      - ARTIFACT_ROOT=s3://mlflow/
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://mluser:mlpassword@postgres:5432/mlflow
+      --default-artifact-root s3://mlflow/
+      --host 0.0.0.0
+      --port 5000
+    networks:
+      - ml-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  #############################################################################
+  # 7. Ollama - Local LLM Runtime (Amazon Q Alternative)
+  #############################################################################
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ml-ollama
+    hostname: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    networks:
+      - ml-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Ollama Model Loader - Pre-download useful models
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ml-ollama-init
+    depends_on:
+      - ollama
+    networks:
+      - ml-network
+    entrypoint: >
+      /bin/sh -c "
+      sleep 15;
+      ollama pull codellama:7b-instruct;
+      ollama pull llama3.3:latest;
+      ollama pull mistral:latest;
+      echo 'Ollama models downloaded successfully';
+      exit 0;
+      "
+    environment:
+      - OLLAMA_HOST=ollama:11434
+
+  #############################################################################
+  # 8. Apache Airflow - Workflow Orchestration (SageMaker Pipelines Alternative)
+  #############################################################################
+  airflow-init:
+    image: apache/airflow:2.9.1-python3.11
+    container_name: ml-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CORE__FERNET_KEY=
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      - _AIRFLOW_DB_MIGRATE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+    networks:
+      - ml-network
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+        echo "Airflow initialization complete"
+
+  airflow-webserver:
+    image: apache/airflow:2.9.1-python3.11
+    container_name: ml-airflow-webserver
+    hostname: airflow-webserver
+    depends_on:
+      - airflow-init
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - airflow-data:/opt/airflow
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CORE__FERNET_KEY=
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    networks:
+      - ml-network
+    command: webserver
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.1-python3.11
+    container_name: ml-airflow-scheduler
+    hostname: airflow-scheduler
+    depends_on:
+      - airflow-init
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - airflow-data:/opt/airflow
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CORE__FERNET_KEY=
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    networks:
+      - ml-network
+    command: scheduler
+    restart: unless-stopped
+
+  airflow-worker:
+    image: apache/airflow:2.9.1-python3.11
+    container_name: ml-airflow-worker
+    hostname: airflow-worker
+    depends_on:
+      - airflow-init
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - airflow-data:/opt/airflow
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__CORE__FERNET_KEY=
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    networks:
+      - ml-network
+    command: celery worker
+    restart: unless-stopped
+
+  #############################################################################
+  # 9. Prometheus - Metrics Collection
+  #############################################################################
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ml-prometheus
+    hostname: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  #############################################################################
+  # 10. Grafana - Visualization & Dashboards
+  #############################################################################
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ml-grafana
+    hostname: grafana
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3001
+    networks:
+      - ml-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  #############################################################################
+  # 11. BentoML - Model Serving (SageMaker Inference Alternative)
+  #############################################################################
+  bentoml:
+    image: bentoml/bentoml:latest
+    container_name: ml-bentoml
+    hostname: bentoml
+    ports:
+      - "3000:3000"
+    volumes:
+      - bentoml-data:/bentoml
+      - ./models:/models
+    environment:
+      - BENTOML_HOME=/bentoml
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    networks:
+      - ml-network
+    command: serve --host 0.0.0.0 --port 3000
+    restart: unless-stopped
+
+  #############################################################################
+  # 12. Feast - Feature Store (SageMaker Feature Store Alternative)
+  #############################################################################
+  feast:
+    image: feastdev/feature-server:latest
+    container_name: ml-feast
+    hostname: feast
+    ports:
+      - "6566:6566"
+    volumes:
+      - feast-data:/feast
+      - ./feast/feature_repo:/feature_repo
+    environment:
+      - FEAST_REGISTRY_TYPE=sql
+      - FEAST_SQL_REGISTRY_URI=postgresql://mluser:mlpassword@postgres:5432/feast
+      - FEAST_ONLINE_STORE_TYPE=redis
+      - FEAST_ONLINE_STORE_CONNECTION_STRING=redis:6379
+    networks:
+      - ml-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  #############################################################################
+  # 13. Traefik - Reverse Proxy & Load Balancer (Optional)
+  #############################################################################
+  traefik:
+    image: traefik:v3.0
+    container_name: ml-traefik
+    hostname: traefik
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8081:8080"  # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml
+      - ./traefik/dynamic:/etc/traefik/dynamic
+      - traefik-certs:/letsencrypt
+    networks:
+      - ml-network
+    restart: unless-stopped
+    command:
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+
+###############################################################################
+# Volumes
+###############################################################################
+volumes:
+  jupyter-data:
+    driver: local
+  code-data:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  minio-data:
+    driver: local
+  mlflow-data:
+    driver: local
+  ollama-models:
+    driver: local
+  airflow-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  bentoml-data:
+    driver: local
+  feast-data:
+    driver: local
+  traefik-certs:
+    driver: local
+
+###############################################################################
+# Networks
+###############################################################################
+networks:
+  ml-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
