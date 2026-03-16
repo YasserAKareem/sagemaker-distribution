@@ -1,0 +1,627 @@
+###############################################################################
+# Hospital AI/ML Platform - Production Deployment
+# Designed for 1,000+ users with multi-persona support
+###############################################################################
+
+services:
+  #############################################################################
+  # 1. Keycloak - Identity & Access Management (IAM)
+  #############################################################################
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: hospital-keycloak
+    hostname: keycloak
+    ports:
+      - "8443:8443"
+      - "9000:9000"  # Management
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+      - ./keycloak/themes:/opt/keycloak/themes
+    environment:
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://postgres:5432/keycloak
+      - KC_DB_USERNAME=mluser
+      - KC_DB_PASSWORD=mlpassword
+      - KC_HOSTNAME=keycloak.hospital.local
+      - KC_HTTP_ENABLED=true
+      - KC_PROXY=edge
+      - KEYCLOAK_ADMIN=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin
+      - KC_FEATURES=token-exchange,admin-fine-grained-authz
+    command: start-dev
+    networks:
+      - ml-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  #############################################################################
+  # 2. PostgreSQL Cluster - Primary Database
+  #############################################################################
+  postgres:
+    image: postgres:16-alpine
+    container_name: hospital-postgres-primary
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    environment:
+      - POSTGRES_USER=mluser
+      - POSTGRES_PASSWORD=mlpassword
+      - POSTGRES_DB=mlplatform
+      - POSTGRES_MULTIPLE_DATABASES=mlflow,airflow,feast,keycloak,fhir,audit
+    networks:
+      - ml-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '8'
+          memory: 16G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mluser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL Replica (Read Replicas for scaling)
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: hospital-postgres-replica
+    hostname: postgres-replica
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-replica-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=mluser
+      - POSTGRES_PASSWORD=mlpassword
+      - POSTGRES_PRIMARY_HOST=postgres
+      - POSTGRES_PRIMARY_PORT=5432
+    networks:
+      - ml-network
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  #############################################################################
+  # 3. Redis Sentinel - High-Availability Cache
+  #############################################################################
+  redis-primary:
+    image: redis:7-alpine
+    container_name: hospital-redis-primary
+    hostname: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 4gb --maxmemory-policy allkeys-lru
+    networks:
+      - ml-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-sentinel:
+    image: redis:7-alpine
+    container_name: hospital-redis-sentinel
+    hostname: redis-sentinel
+    ports:
+      - "26379:26379"
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+    networks:
+      - ml-network
+    depends_on:
+      - redis-primary
+    restart: unless-stopped
+
+  #############################################################################
+  # 4. MinIO Distributed - High-Performance Object Storage
+  #############################################################################
+  minio1:
+    image: minio/minio:latest
+    container_name: hospital-minio1
+    hostname: minio1
+    ports:
+      - "9001:9000"
+      - "9091:9001"
+    volumes:
+      - minio1-data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_DISTRIBUTED_MODE_ENABLED=yes
+      - MINIO_DISTRIBUTED_NODES=minio1,minio2,minio3,minio4
+    command: server http://minio{1...4}/data --console-address ":9001"
+    networks:
+      - ml-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio2:
+    image: minio/minio:latest
+    container_name: hospital-minio2
+    hostname: minio2
+    volumes:
+      - minio2-data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_DISTRIBUTED_MODE_ENABLED=yes
+      - MINIO_DISTRIBUTED_NODES=minio1,minio2,minio3,minio4
+    command: server http://minio{1...4}/data --console-address ":9001"
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  minio3:
+    image: minio/minio:latest
+    container_name: hospital-minio3
+    hostname: minio3
+    volumes:
+      - minio3-data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_DISTRIBUTED_MODE_ENABLED=yes
+      - MINIO_DISTRIBUTED_NODES=minio1,minio2,minio3,minio4
+    command: server http://minio{1...4}/data --console-address ":9001"
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  minio4:
+    image: minio/minio:latest
+    container_name: hospital-minio4
+    hostname: minio4
+    volumes:
+      - minio4-data:/data
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - MINIO_DISTRIBUTED_MODE_ENABLED=yes
+      - MINIO_DISTRIBUTED_NODES=minio1,minio2,minio3,minio4
+    command: server http://minio{1...4}/data --console-address ":9001"
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  #############################################################################
+  # 5. vLLM Server - Production-Grade LLM Inference (Replaces Ollama)
+  #############################################################################
+  vllm-server-1:
+    image: vllm/vllm-openai:latest
+    container_name: hospital-vllm-1
+    hostname: vllm-1
+    ports:
+      - "8001:8000"
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    environment:
+      - MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.2
+      - TENSOR_PARALLEL_SIZE=1
+      - GPU_MEMORY_UTILIZATION=0.9
+      - MAX_MODEL_LEN=4096
+      - SERVED_MODEL_NAME=clinical-assistant
+    command: ["--model", "mistralai/Mistral-7B-Instruct-v0.2", "--host", "0.0.0.0", "--port", "8000"]
+    networks:
+      - ml-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  vllm-server-2:
+    image: vllm/vllm-openai:latest
+    container_name: hospital-vllm-2
+    hostname: vllm-2
+    ports:
+      - "8002:8000"
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    environment:
+      - MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.2
+      - TENSOR_PARALLEL_SIZE=1
+      - GPU_MEMORY_UTILIZATION=0.9
+      - MAX_MODEL_LEN=4096
+      - SERVED_MODEL_NAME=clinical-assistant
+    command: ["--model", "mistralai/Mistral-7B-Instruct-v0.2", "--host", "0.0.0.0", "--port", "8000"]
+    networks:
+      - ml-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  #############################################################################
+  # 6. HAPI FHIR Server - Healthcare Interoperability
+  #############################################################################
+  fhir-server:
+    image: hapiproject/hapi:latest
+    container_name: hospital-fhir
+    hostname: fhir
+    ports:
+      - "8082:8080"
+    volumes:
+      - fhir-data:/data/hapi
+    environment:
+      - spring.datasource.url=jdbc:postgresql://postgres:5432/fhir
+      - spring.datasource.username=mluser
+      - spring.datasource.password=mlpassword
+      - spring.datasource.driverClassName=org.postgresql.Driver
+      - spring.jpa.properties.hibernate.dialect=ca.uhn.fhir.jpa.model.dialect.HapiFhirPostgres94Dialect
+      - hapi.fhir.default_encoding=json
+      - hapi.fhir.fhir_version=r4
+      - hapi.fhir.allow_external_references=true
+      - hapi.fhir.allow_multiple_delete=true
+    networks:
+      - ml-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/fhir/metadata"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  #############################################################################
+  # 7. Orthanc DICOM Server - Medical Imaging
+  #############################################################################
+  orthanc:
+    image: jodogne/orthanc:latest
+    container_name: hospital-orthanc
+    hostname: orthanc
+    ports:
+      - "8042:8042"  # Web interface
+      - "4242:4242"  # DICOM protocol
+    volumes:
+      - orthanc-data:/var/lib/orthanc/db
+      - ./orthanc/orthanc.json:/etc/orthanc/orthanc.json
+    environment:
+      - ORTHANC_USERNAME=admin
+      - ORTHANC_PASSWORD=admin
+      - ORTHANC_AUTHENTICATION_ENABLED=true
+      - ORTHANC_REGISTERED_USERS={"doctors":"doctors123","radiologists":"radio123"}
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  #############################################################################
+  # 8. JupyterHub - Multi-User Notebook Server
+  #############################################################################
+  jupyterhub:
+    image: jupyterhub/jupyterhub:latest
+    container_name: hospital-jupyterhub
+    hostname: jupyterhub
+    ports:
+      - "8000:8000"
+    volumes:
+      - jupyterhub-data:/srv/jupyterhub
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./jupyterhub/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py
+    environment:
+      - DOCKER_NETWORK_NAME=ml-network
+      - OAUTH2_CLIENT_ID=jupyterhub
+      - OAUTH2_CLIENT_SECRET=jupyterhub-secret
+      - OAUTH2_AUTHORIZE_URL=http://keycloak:9000/realms/hospital/protocol/openid-connect/auth
+      - OAUTH2_TOKEN_URL=http://keycloak:9000/realms/hospital/protocol/openid-connect/token
+    networks:
+      - ml-network
+    depends_on:
+      - keycloak
+    restart: unless-stopped
+
+  #############################################################################
+  # 9. MLflow - Experiment Tracking & Model Registry
+  #############################################################################
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: hospital-mlflow
+    hostname: mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    environment:
+      - MLFLOW_S3_ENDPOINT_URL=http://minio1:9000
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin
+      - BACKEND_STORE_URI=postgresql://mluser:mlpassword@postgres:5432/mlflow
+      - ARTIFACT_ROOT=s3://mlflow/
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://mluser:mlpassword@postgres:5432/mlflow
+      --default-artifact-root s3://mlflow/
+      --host 0.0.0.0
+      --port 5000
+    networks:
+      - ml-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio1:
+        condition: service_healthy
+    restart: unless-stopped
+
+  #############################################################################
+  # 10. Apache Airflow - Workflow Orchestration
+  #############################################################################
+  airflow-webserver:
+    image: apache/airflow:2.9.1-python3.11
+    container_name: hospital-airflow-webserver
+    hostname: airflow-webserver
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - airflow-data:/opt/airflow
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://mluser:mlpassword@postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    networks:
+      - ml-network
+    command: webserver
+    restart: unless-stopped
+    deploy:
+      replicas: 2  # Load balanced
+
+  #############################################################################
+  # 11. Grafana - Monitoring Dashboards
+  #############################################################################
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hospital-grafana
+    hostname: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_GENERIC_OAUTH_ENABLED=true
+      - GF_AUTH_GENERIC_OAUTH_NAME=Keycloak
+      - GF_AUTH_GENERIC_OAUTH_CLIENT_ID=grafana
+      - GF_AUTH_GENERIC_OAUTH_CLIENT_SECRET=grafana-secret
+      - GF_AUTH_GENERIC_OAUTH_AUTH_URL=http://keycloak:9000/realms/hospital/protocol/openid-connect/auth
+      - GF_AUTH_GENERIC_OAUTH_TOKEN_URL=http://keycloak:9000/realms/hospital/protocol/openid-connect/token
+      - GF_AUTH_GENERIC_OAUTH_API_URL=http://keycloak:9000/realms/hospital/protocol/openid-connect/userinfo
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - ml-network
+    depends_on:
+      - prometheus
+      - keycloak
+    restart: unless-stopped
+
+  #############################################################################
+  # 12. Prometheus - Metrics Collection
+  #############################################################################
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hospital-prometheus
+    hostname: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/rules:/etc/prometheus/rules
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  #############################################################################
+  # 13. Loki - Log Aggregation
+  #############################################################################
+  loki:
+    image: grafana/loki:latest
+    container_name: hospital-loki
+    hostname: loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml
+    command: -config.file=/etc/loki/loki-config.yml
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  #############################################################################
+  # 14. Traefik - Load Balancer & Reverse Proxy
+  #############################################################################
+  traefik:
+    image: traefik:v3.0
+    container_name: hospital-traefik
+    hostname: traefik
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8081:8080"  # Dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml
+      - ./traefik/dynamic:/etc/traefik/dynamic
+      - traefik-certs:/letsencrypt
+    command:
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=admin@hospital.local
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  #############################################################################
+  # 15. Elasticsearch - Search & Log Storage
+  #############################################################################
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: hospital-elasticsearch
+    hostname: elasticsearch
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+    networks:
+      - ml-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  #############################################################################
+  # 16. Metabase - Business Intelligence for Management
+  #############################################################################
+  metabase:
+    image: metabase/metabase:latest
+    container_name: hospital-metabase
+    hostname: metabase
+    ports:
+      - "3001:3000"
+    volumes:
+      - metabase-data:/metabase-data
+    environment:
+      - MB_DB_TYPE=postgres
+      - MB_DB_DBNAME=metabase
+      - MB_DB_PORT=5432
+      - MB_DB_USER=mluser
+      - MB_DB_PASS=mlpassword
+      - MB_DB_HOST=postgres
+    networks:
+      - ml-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  #############################################################################
+  # 17. Audit Logger - HIPAA Compliance
+  #############################################################################
+  audit-logger:
+    image: fluent/fluentd:latest
+    container_name: hospital-audit-logger
+    hostname: audit-logger
+    ports:
+      - "24224:24224"
+    volumes:
+      - ./fluentd/fluent.conf:/fluentd/etc/fluent.conf
+      - audit-logs:/fluentd/log
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=audit
+      - POSTGRES_USER=mluser
+      - POSTGRES_PASS=mlpassword
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+###############################################################################
+# Volumes
+###############################################################################
+volumes:
+  keycloak-data:
+    driver: local
+  postgres-data:
+    driver: local
+  postgres-replica-data:
+    driver: local
+  redis-data:
+    driver: local
+  minio1-data:
+    driver: local
+  minio2-data:
+    driver: local
+  minio3-data:
+    driver: local
+  minio4-data:
+    driver: local
+  vllm-models:
+    driver: local
+  fhir-data:
+    driver: local
+  orthanc-data:
+    driver: local
+  jupyterhub-data:
+    driver: local
+  mlflow-data:
+    driver: local
+  airflow-data:
+    driver: local
+  grafana-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  loki-data:
+    driver: local
+  traefik-certs:
+    driver: local
+  elasticsearch-data:
+    driver: local
+  metabase-data:
+    driver: local
+  audit-logs:
+    driver: local
+
+###############################################################################
+# Networks
+###############################################################################
+networks:
+  ml-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
